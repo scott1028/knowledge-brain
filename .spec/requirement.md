@@ -6,13 +6,17 @@
 `codex`, `pi`, `gemini`, `opencode`, or `agy`) use a local Markdown
 knowledge base.
 
-The tool prepares a knowledge repo, links the repo's `src/` into the current
-project as `.knowledge` (so sandboxed agents can reach an out-of-project repo
-through an in-project path), injects a temporary Agent Skills skill into
-the current project (SSOT at `.agents/skills/`, with symlinks for the other
-agents' skills dirs), launches the agent, and restores the project after the
-session ends. It also supports one-way sync between a Google Drive folder and
-the knowledge repo's `src/` directory.
+The tool prepares a knowledge repo, starts (or reuses) a shared MCP server that
+serves the repo's notes as read-only tools, injects a temporary Agent Skills
+skill into the current project (SSOT at `.agents/skills/`, with symlinks for the
+other agents' skills dirs), registers the server in the agent's own MCP config,
+launches the agent, and restores the project after the session ends. It also
+supports one-way sync between a Google Drive folder and the knowledge repo's
+`src/` directory.
+
+The skill is the trigger ("search before replying"); the MCP tools are the
+mechanism. Because the server reads the repo directly, out-of-project repos work
+without granting a sandboxed agent filesystem access to them.
 
 ## Current Codebase Facts
 
@@ -21,7 +25,9 @@ the knowledge repo's `src/` directory.
 - The CLI entry point is `recall-engine`.
 - The CLI is built with Typer.
 - Google Drive access uses `google-api-python-client` and `google-auth`.
-- The implemented commands are `wrap`, `unwrap`, `sync`, and `doctor`.
+- The MCP server is built on the `mcp` SDK (FastMCP, streamable HTTP).
+- The implemented commands are `wrap`, `unwrap`, `sync`, and `doctor`, plus a
+  hidden `mcp-serve` used internally to spawn the shared server.
 - The project uses `uv run pytest` and `uv run ruff check src tests` for checks.
 - No JavaScript, TypeScript, webpack, Vite, or Next.js config is present.
 
@@ -153,7 +159,7 @@ Scenario: inject the rendered skill at the Agent Skills SSOT
 - Given the CLI has resolved the knowledge repo path
 - When the wrapper injects the skill
 - Then it writes `.agents/skills/recall-engine/SKILL.md`
-- And the rendered skill points to `<repo>/src/`
+- And the skill directs the agent to the MCP tools, naming no repo path
 - And it writes `.agents/skills/.recall-engine-marker.json`
 - And the marker records the resolved repo path so a later wrap in the same
   directory can reuse it without re-specifying the repo env var
@@ -168,19 +174,28 @@ Scenario: symlink the skill into the other agents' skills dirs
 - And `codex` and `agy` read `.agents/skills/` directly, so they get no symlink
 - And all symlinks are removed when the session ends
 
-Scenario: link the knowledge base into the project as `.knowledge`
-- Given the CLI has resolved the knowledge repo path
-- When the wrapper injects the skill
-- Then `.knowledge` in the project is a symlink to `<repo>/src`
-- And the rendered skill searches `.knowledge/**/*.md` (an in-project path)
-- And the link is removed when the session ends
+Scenario: register the MCP server in the agent's config
+- Given the shared MCP server is running
+- When the wrapper injects the MCP config for the launched agent
+- Then the agent's own config file gains a `recall-engine` server entry
+  (`.mcp.json` for claude, `.codex/config.toml` for codex, `.pi/mcp.json` for
+  pi, `.gemini/settings.json` for gemini, `opencode.json` for opencode, and
+  `.agents/mcp_config.json` for agy)
+- And the entry carries the server URL, an `X-Recall-Repo` header naming the
+  resolved repo, and an `X-Recall-Token` header
+- And the entry is removed when the session ends
 
-Scenario: preserve an existing `.knowledge` entry
-- Given `.knowledge` already exists in the project
+> Note: codex reads its `.codex/config.toml` only for trusted projects; an
+> untrusted project must be trusted (first-run prompt) before codex sees the
+> entry. Verified: codex 0.144.1 loads the project-local file and forwards the
+> custom headers.
+
+Scenario: preserve an existing MCP config
+- Given the agent's MCP config file already exists with other servers
 - And it was not created by the active wrapper session
-- When the wrapper injects its skill
-- Then the existing `.knowledge` is moved to a backup location
-- And the original `.knowledge` is restored after the session ends
+- When the wrapper injects its server entry
+- Then only the `recall-engine` entry is added
+- And the file's original content is restored after the session ends
 
 Scenario: preserve an existing user skill
 - Given `recall-engine/` already exists in the SSOT dir or in an
@@ -225,6 +240,58 @@ Scenario: clean leftovers from a pre-SSOT version
 - When the CLI restores skill state
 - Then the legacy skill state is cleaned as well
 
+## Feature: Share One MCP Server Across Sessions
+
+One streamable-HTTP MCP server per machine serves every wrap session and every
+repo. It exposes `search_knowledge(query)`, `read_note(path)`, and
+`list_notes()` as read-only tools, and is started on demand rather than run as a
+user-managed daemon.
+
+Scenario: start the server on the first wrap
+- Given no recall-engine MCP server is running
+- When the user runs `recall-engine wrap <agent>`
+- Then the CLI spawns a detached server bound to `127.0.0.1` on an ephemeral port
+- And it records the pid, port, url, token, and owner pid in
+  `/tmp/recall-engine-mcp-<uid>.json`
+- And it waits until the server accepts connections before launching the agent
+
+Scenario: reuse the server for a later wrap
+- Given a recall-engine MCP server is already running and reachable
+- When a second `wrap` starts, in any directory and against any repo
+- Then no second server is spawned
+- And the second session's pid is added to the state file's `owners`
+
+Scenario: route each connection to its own repo
+- Given two wrap sessions share one server with different knowledge repos
+- When an agent calls `search_knowledge`
+- Then the server resolves the repo from the connection's `X-Recall-Repo` header
+- And results only ever come from that session's repo
+
+Scenario: reject an unconfigured client
+- Given the server was started with a token
+- When a client calls a tool without the matching `X-Recall-Token` header
+- Then the tool call fails with an authorization error
+- And a call whose `X-Recall-Repo` header names a directory without `src/` is
+  rejected the same way
+
+Scenario: stop the server with the last session
+- Given two sessions own the running server
+- When the first session exits
+- Then the server keeps running and only that pid leaves `owners`
+- And when the last owner exits, the server is terminated
+- And the state file is removed
+
+Scenario: reclaim a stale server record
+- Given the state file records a server whose process is dead or not listening
+- When the user runs the next `wrap`
+- Then the stale record is replaced by a freshly spawned server
+
+Scenario: reach the server from pi
+- Given `pi` is installed without the `pi-mcp-adapter` extension
+- When the user runs `recall-engine wrap pi`
+- Then `doctor` advises installing the adapter
+- And pi still receives the skill, but without MCP tools
+
 ## Feature: Use the Knowledge Base During Agent Sessions
 
 The injected skill must guide the agent to consult the Markdown knowledge base
@@ -236,14 +303,14 @@ Scenario: answer with knowledge-base context
 - Given an agent is running through `recall-engine wrap <agent>`
 - And the user sends any message
 - When the agent prepares the reply
-- Then the skill instructs the agent to grep and read `.knowledge/**/*.md` (the
-  in-project link to `<repo>/src`) for existing processing records, notes, or
-  prior handling of similar problems
+- Then the skill instructs the agent to call `search_knowledge` (and
+  `read_note` / `list_notes` as needed) for existing processing records, notes,
+  or prior handling of similar problems
 - And any prior experience found should be factored into the reply and cite the
-  source file path
+  note path returned by the tools
 
 Scenario: answer when no matching note exists
-- Given the agent searched `.knowledge/**/*.md`
+- Given the agent called `search_knowledge`
 - And no relevant note was found
 - When the agent answers the user
 - Then it should say no relevant knowledge-base entry was found
@@ -383,6 +450,24 @@ Scenario: a required check fails
 - And the output includes a concrete fix instruction
 - And the command exits with code `1`
 
+Scenario: report a reachable MCP server
+- Given a wrap session has started the shared MCP server
+- When the user runs `doctor`
+- Then the MCP server check prints `[ok]` with the server URL and owner count
+
+Scenario: no MCP server is running
+- Given no wrap session is active
+- When the user runs `doctor`
+- Then the MCP server check prints `[skip]`
+- And that skip does not make doctor fail
+
+Scenario: report a stale MCP server record
+- Given the state file records a server that is not reachable
+- When the user runs `doctor`
+- Then the MCP server check prints `[fail]`
+- And the fix instruction names `recall-engine unwrap`
+- And the command exits with code `1`
+
 Scenario: Drive folder is not configured
 - Given `KNOWLEDGE_DRIVE_FOLDER` is unset
 - When the user runs `doctor`
@@ -392,7 +477,9 @@ Scenario: Drive folder is not configured
 ## Out of Scope for v1
 
 - LLM proxying or traffic interception
-- Background daemon mode
+- A user-managed daemon lifecycle (`start` / `stop` commands, autostart on
+  boot). The shared MCP server is in scope, but it is spawned on demand by
+  `wrap` and stops with the last session.
 - Two-way Drive merge
 - Delete propagation between Drive and the repo
 - Recursive Drive sync

@@ -7,6 +7,7 @@ from recall_engine import doctor
 from recall_engine.cli import app
 from recall_engine.doctor import run_doctor
 from recall_engine.drive import AUTH_HELP, DriveError
+from recall_engine.mcp_supervisor import ServerStatus
 
 runner = CliRunner()
 
@@ -20,6 +21,9 @@ GCLOUD_COMMAND = (
 def install_passing_env(monkeypatch, tmp_path) -> None:
     """Make every check pass without touching the real environment."""
     monkeypatch.setattr(doctor.shutil, "which", lambda name: f"/usr/bin/{name}")
+    # Never read the host's real /tmp state file: a wrap session running on the
+    # dev machine would otherwise leak into the assertions.
+    monkeypatch.setattr(doctor, "server_status", lambda: None)
     key = tmp_path / "id_ed25519"
     key.write_text("fake key\n")
     monkeypatch.setenv("SSH_KEY", str(key))
@@ -136,6 +140,42 @@ def test_unexpected_drive_error_fails_without_traceback(monkeypatch, tmp_path, c
     assert "[fail] gcloud auth" in output
     assert "network unreachable" in output
     assert "Traceback" not in output
+
+
+def test_no_running_mcp_server_is_skip_not_fail(monkeypatch, tmp_path, capsys):
+    install_passing_env(monkeypatch, tmp_path)
+
+    assert run_doctor() is True
+    output = capsys.readouterr().out
+    assert "[skip] mcp server: not running (started on demand by `wrap`)" in output
+    assert "[fail]" not in output
+
+
+def test_reachable_mcp_server_reports_url_and_owners(monkeypatch, tmp_path, capsys):
+    install_passing_env(monkeypatch, tmp_path)
+    status = ServerStatus(
+        url="http://127.0.0.1:4321/mcp", pid=999, owners=[111, 222], reachable=True
+    )
+    monkeypatch.setattr(doctor, "server_status", lambda: status)
+
+    assert run_doctor() is True
+    output = capsys.readouterr().out
+    assert "[ok] mcp server: reachable at http://127.0.0.1:4321/mcp" in output
+    assert "pid 999, 2 owner(s)" in output
+
+
+def test_stale_mcp_server_state_fails_with_unwrap_hint(monkeypatch, tmp_path, capsys):
+    install_passing_env(monkeypatch, tmp_path)
+    status = ServerStatus(
+        url="http://127.0.0.1:4321/mcp", pid=999, owners=[111], reachable=False
+    )
+    monkeypatch.setattr(doctor, "server_status", lambda: status)
+
+    assert run_doctor() is False
+    output = capsys.readouterr().out
+    assert "[fail] mcp server" in output
+    assert "stale state" in output
+    assert "recall-engine unwrap" in output
 
 
 def test_drive_folder_unset_is_skip_not_fail(monkeypatch, tmp_path, capsys):

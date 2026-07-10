@@ -1,11 +1,29 @@
 import json
 import os
 
+import pytest
 from typer.testing import CliRunner
 
 from recall_engine.cli import app
+from recall_engine.mcp_supervisor import ServerInfo
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def stub_mcp_server(monkeypatch):
+    """Keep `wrap`/`unwrap` from spawning a real server or touching the global
+    /tmp state file. The per-project MCP-config injection still runs for real."""
+    monkeypatch.setattr(
+        "recall_engine.cli.ensure_server",
+        lambda token=None: ServerInfo(
+            url="http://127.0.0.1:9/mcp", port=9, token="testtok", pid=os.getpid()
+        ),
+    )
+    monkeypatch.setattr(
+        "recall_engine.cli.release_server",
+        lambda owner_pid=None, force=False: False,
+    )
 
 
 def install_fake_claude(tmp_path, monkeypatch, script: str, name: str = "claude") -> None:
@@ -111,20 +129,20 @@ def test_wrap_claude_full_lifecycle(monkeypatch, tmp_path):
     ).exists()
 
 
-def test_wrap_creates_and_restores_knowledge_symlink(monkeypatch, tmp_path):
-    # The whole point: the agent reads the knowledge base through an in-project
-    # .knowledge link even though the repo lives outside the project.
+def test_wrap_injects_and_restores_mcp_config(monkeypatch, tmp_path):
+    # The agent's MCP config points at the shared server (with the repo header)
+    # while it runs, and is cleaned up afterwards. No .knowledge link is created.
     repo = tmp_path / "repo"
     (repo / "src").mkdir(parents=True)
-    (repo / "src" / "note.md").write_text("kb\n")
     project = tmp_path / "project"
     project.mkdir()
-    knowledge = project / ".knowledge"
+    mcp_json = project / ".mcp.json"
     probe = tmp_path / "probe.txt"
+    # Fake claude records the injected .mcp.json contents while it runs.
     install_fake_claude(
         tmp_path,
         monkeypatch,
-        f'cat "{knowledge / "note.md"}" > "{probe}"\nexit 0',
+        f'cat "{mcp_json}" > "{probe}"\nexit 0',
     )
     monkeypatch.setenv("KNOWLEDGE_REPO_PATH", str(repo))
     monkeypatch.delenv("KNOWLEDGE_REPO_SSH", raising=False)
@@ -132,11 +150,15 @@ def test_wrap_creates_and_restores_knowledge_symlink(monkeypatch, tmp_path):
 
     result = runner.invoke(app, ["wrap", "claude"])
     assert result.exit_code == 0
-    # Knowledge file was reachable in-project during the child run.
-    assert probe.read_text().strip() == "kb"
-    # ...and the link is cleaned up afterwards.
-    assert not knowledge.exists()
-    assert not knowledge.is_symlink()
+    # The MCP config was present during the child run and pinned the repo header.
+    injected = json.loads(probe.read_text())
+    entry = injected["mcpServers"]["recall-engine"]
+    assert entry["type"] == "http"
+    assert entry["url"] == "http://127.0.0.1:9/mcp"
+    assert entry["headers"]["X-Recall-Repo"] == str(repo.resolve())
+    # ...and it is cleaned up afterwards; no .knowledge link is ever created.
+    assert not mcp_json.exists()
+    assert not (project / ".knowledge").exists()
 
 
 def test_wrap_forwards_extra_args_to_agent(monkeypatch, tmp_path):
@@ -241,6 +263,29 @@ def test_wrap_agy_full_lifecycle(monkeypatch, tmp_path):
     assert probe.read_text().strip() == "present"
     assert not (project / ".agy").exists()
     assert not skill_dir.exists()
+
+
+def test_wrap_agy_launched_with_add_dir(monkeypatch, tmp_path):
+    # agy only reads the injected .agents/ config when the project dir is in its
+    # workspace, so wrap must launch it with `--add-dir <project>`.
+    from pathlib import Path
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    out = tmp_path / "args.txt"
+    install_fake_claude(tmp_path, monkeypatch, f'echo "$@" > "{out}"\nexit 0', name="agy")
+    monkeypatch.setenv("KNOWLEDGE_REPO_PATH", str(repo))
+    monkeypatch.delenv("KNOWLEDGE_REPO_SSH", raising=False)
+    monkeypatch.chdir(project)
+
+    result = runner.invoke(app, ["wrap", "agy", "chat"])
+    assert result.exit_code == 0
+    parts = out.read_text().split()
+    assert parts[0] == "--add-dir"
+    assert Path(parts[1]).resolve() == project.resolve()
+    assert parts[2] == "chat"  # user args still forwarded, after the pre-args
 
 
 def test_wrap_claude_attaches_to_live_session(monkeypatch, tmp_path):
@@ -363,7 +408,7 @@ def test_unwrap_cleans_stale_state(monkeypatch, tmp_path):
 
     result = runner.invoke(app, ["unwrap"])
     assert result.exit_code == 0
-    assert "restored leftover skill state" in result.output
+    assert "restored leftover skill and MCP state" in result.output
     assert not skill_dir.exists()
     assert not marker.exists()
 

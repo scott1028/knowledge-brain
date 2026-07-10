@@ -63,6 +63,7 @@ def launch_agent(
     argv: list[str] | None = None,
     agent: str = "claude",
     install_hint: str | None = None,
+    pre_args: list[str] | None = None,
 ) -> int:
     """Run the agent command with RECALL_REPO_PATH set; return its exit code.
 
@@ -71,6 +72,9 @@ def launch_agent(
     matching what typing the command in a terminal does.
     stdin/stdout/stderr are inherited so the interactive TUI works.
     SIGINT/SIGTERM are forwarded to the child while it runs.
+
+    pre_args are placed before the caller's argv (e.g. agy's `--add-dir
+    <project>`, needed for it to see the injected .agents/ config).
     """
     if not _AGENT_NAME_RE.match(agent):
         raise LauncherError(f"Invalid agent name '{agent}'.")
@@ -89,7 +93,7 @@ def launch_agent(
 
     env = {**os.environ, "RECALL_REPO_PATH": str(repo_path)}
     child = subprocess.Popen(
-        [shell, "-i", "-c", f'{agent} "$@"', agent, *(argv or [])],
+        [shell, "-i", "-c", f'{agent} "$@"', agent, *(pre_args or []), *(argv or [])],
         env=env,
     )
 

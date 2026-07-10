@@ -59,6 +59,16 @@ def test_extra_argv_forwarded(tmp_path, monkeypatch):
     assert out.read_text().strip() == "--resume abc"
 
 
+def test_pre_args_precede_user_argv(tmp_path, monkeypatch):
+    # pre_args (e.g. agy's --add-dir <project>) must come before the user's argv.
+    out = tmp_path / "args.txt"
+    install_fake_claude(tmp_path, monkeypatch, f'echo "$@" > "{out}"')
+    launch_agent(
+        tmp_path, ["--resume", "x"], pre_args=["--add-dir", "/proj"]
+    )
+    assert out.read_text().strip() == "--add-dir /proj --resume x"
+
+
 def test_shell_function_takes_priority_over_binary(tmp_path, monkeypatch):
     # Regression: a claude() function in the rc file must win over the
     # PATH binary, like typing `claude` in a real terminal.

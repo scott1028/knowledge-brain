@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import typer
 
@@ -20,6 +21,17 @@ from recall_engine.launcher import (
     LauncherError,
     detect_agent,
     launch_agent,
+)
+from recall_engine.mcp_config import (
+    McpConfigError,
+    inject_mcp_config,
+    restore_mcp_config,
+)
+from recall_engine.mcp_server import run_server
+from recall_engine.mcp_supervisor import (
+    SupervisorError,
+    ensure_server,
+    release_server,
 )
 from recall_engine.repo import RepoError, ensure_repo
 from recall_engine.skill import (
@@ -74,32 +86,51 @@ def wrap(ctx: typer.Context, agent: str) -> None:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from exc
     typer.echo(f"knowledge repo: {repo}")
+    pid = os.getpid()
+    # Inject the skill (the reliable "search first" trigger), start/reuse the
+    # shared MCP server, and point this agent's config at it. All three are torn
+    # down in the finally, and each restore is idempotent and safe to call even
+    # when its setup step did not run.
     try:
         inject_skill(repo)
-    except SkillError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(1) from exc
-    typer.echo(f"launching {agent}...")
-    try:
+        server = ensure_server()
+        inject_mcp_config(family, repo, server.url, server.token)
+        typer.echo(f"launching {agent}...")
+        # agy only reads the injected .agents/ config when the project dir is in
+        # its workspace, so pass `--add-dir <project>` for it.
+        pre_args = (
+            ["--add-dir", str(Path.cwd())]
+            if AGENTS[family].needs_workspace_dir
+            else []
+        )
         exit_code = launch_agent(
             repo,
             argv=agent_args,
             agent=agent,
             install_hint=AGENTS[family].install_hint,
+            pre_args=pre_args,
         )
-    except LauncherError as exc:
+    except (SkillError, SupervisorError, McpConfigError, LauncherError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from exc
     finally:
-        restore_skill(owner_pid=os.getpid())
+        restore_mcp_config(owner_pid=pid)
+        restore_skill(owner_pid=pid)
+        release_server(owner_pid=pid)
     raise typer.Exit(exit_code)
 
 
 @app.command()
 def unwrap() -> None:
     """Clean up leftovers from an aborted wrap session."""
-    if restore_skill(force=True):
-        typer.echo("restored leftover skill state")
+    # Skill and MCP-config state are per-project, so force-clean them here.
+    cleaned = restore_mcp_config(force=True)
+    cleaned = restore_skill(force=True) or cleaned
+    # The MCP server is machine-global; only stop it when no live owner remains
+    # (never force-kill — other projects may still be using the shared server).
+    release_server(owner_pid=os.getpid())
+    if cleaned:
+        typer.echo("restored leftover skill and MCP state")
     else:
         typer.echo("nothing to clean")
 
@@ -147,3 +178,13 @@ def doctor() -> None:
     """Diagnose ssh key, repo config, gcloud Drive access, and agent CLIs on PATH."""
     if not run_doctor():
         raise typer.Exit(1)
+
+
+@app.command(name="mcp-serve", hidden=True)
+def mcp_serve(
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    token: str = "",
+) -> None:
+    """Run the shared knowledge MCP server (spawned by `wrap`; internal use)."""
+    run_server(host, port, token or None)

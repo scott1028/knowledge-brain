@@ -5,11 +5,17 @@ description: Use at the start of every conversation. Invoke this skill before an
 
 # Recall Engine
 
-The knowledge base is available inside this project at `{knowledge_dir}/` as
-Markdown files (an in-project link to the shared knowledge repo, so it stays
-reachable even for sandboxed agents). Treat it as the authoritative record of
-past processing, notes, decisions, and prior experience handling similar
-problems.
+The knowledge base is served by the **recall-engine MCP server**, which exposes
+these tools:
+
+- `search_knowledge(query)` — search the knowledge base and return matching
+  note paths with snippets.
+- `read_note(path)` — read the full text of a matching note.
+- `list_notes()` — list available note file names (to discover relevant files).
+
+Treat the knowledge base as the authoritative record of past processing, notes,
+decisions, and prior experience handling similar problems. The server reads the
+knowledge repo directly, so you never need filesystem access to it.
 
 ## Before replying
 
@@ -19,9 +25,9 @@ of similar problems. Never reply "I don't know" or answer from general knowledge
 before searching:
 
 1. Extract keywords from the message.
-2. Grep for those keywords across `{knowledge_dir}/**/*.md`
-   (also Glob `{knowledge_dir}/**/*.md` to discover relevant file names).
-3. Read the matching files and factor any prior experience into your reply.
+2. Call `search_knowledge` with those keywords (call `list_notes` to discover
+   relevant file names when a keyword search is inconclusive).
+3. Call `read_note` on the matches and factor any prior experience into your reply.
 
 Treat these as strong signals to search — but never limit the search to them:
 
@@ -43,11 +49,11 @@ When in doubt, search.
 
 - Prefer knowledge-base content (past experience) over general knowledge
   whenever they overlap.
-- Cite the source: quote the knowledge-base file path (e.g.
-  `{knowledge_dir}/<file>.md`) in the reply.
+- Cite the source: quote the note path returned by the tools (e.g. the `path`
+  field of a `search_knowledge` result) in the reply.
 - If nothing relevant is found, say so explicitly, then reply from
   general knowledge.
 
 ## Constraints
 
-- Do not modify the knowledge repo unless the user explicitly asks.
+- These tools are read-only. Do not attempt to modify the knowledge repo.

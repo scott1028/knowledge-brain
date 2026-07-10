@@ -54,13 +54,14 @@ def test_inject_creates_rendered_skill_and_marker(project, tmp_path):
 
     skill_dir, marker, _ = skill_paths(project)
     content = (skill_dir / "SKILL.md").read_text()
-    # The rendered skill points at the in-project .knowledge link, not the repo.
-    assert f"{project / '.knowledge'}/" in content
+    # The rendered skill points at the recall-engine MCP server tools.
+    assert "search_knowledge" in content
     assert "name: recall-engine" in content
     record = json.loads(marker.read_text())
     assert record["pids"] == [os.getpid()]
     assert record["backup"] is None
-    assert record["knowledge"]["path"] == str(project / ".knowledge")
+    assert "knowledge" not in record  # no more in-project .knowledge link
+    assert record["repo_path"] == str(repo)
     assert record["injected_at"]
 
 
@@ -95,33 +96,21 @@ def test_inject_skips_agent_dir_that_resolves_to_ssot(project, tmp_path):
     assert (project / ".pi" / "skills" / "recall-engine").is_symlink()
 
 
-def test_inject_creates_knowledge_symlink_to_repo_src(project, tmp_path):
+def test_inject_does_not_create_knowledge_link(project, tmp_path):
     repo = tmp_path / "repo"
     (repo / "src").mkdir(parents=True)
     (repo / "src" / "note.md").write_text("hello\n")
 
     inject_skill(repo)
 
+    # The MCP server reads the repo directly; no in-project .knowledge link.
     knowledge = project / ".knowledge"
-    assert knowledge.is_symlink()
-    assert knowledge.resolve() == (repo / "src").resolve()
-    # Reachable through the in-project link.
-    assert (knowledge / "note.md").read_text() == "hello\n"
-
-
-def test_restore_removes_knowledge_symlink(project, tmp_path):
-    repo = tmp_path / "repo"
-    (repo / "src").mkdir(parents=True)
-    inject_skill(repo)
-    knowledge = project / ".knowledge"
-    assert knowledge.is_symlink()
-
-    assert restore_skill(owner_pid=os.getpid()) is True
     assert not knowledge.exists()
     assert not knowledge.is_symlink()
 
 
-def test_preexisting_knowledge_dir_backed_up_and_restored(project, tmp_path, capsys):
+def test_inject_leaves_existing_knowledge_untouched(project, tmp_path):
+    # We no longer manage .knowledge, so a user's own .knowledge is left alone.
     repo = tmp_path / "repo"
     (repo / "src").mkdir(parents=True)
     existing = project / ".knowledge"
@@ -129,13 +118,31 @@ def test_preexisting_knowledge_dir_backed_up_and_restored(project, tmp_path, cap
     (existing / "user.md").write_text("user knowledge\n")
 
     inject_skill(repo)
-    assert "moved to backup" in capsys.readouterr().err
-    assert existing.is_symlink()  # replaced by our link during the session
+    assert existing.is_dir()
+    assert not existing.is_symlink()
+    assert (existing / "user.md").read_text() == "user knowledge\n"
 
     assert restore_skill(owner_pid=os.getpid()) is True
-    assert not existing.is_symlink()
     assert existing.is_dir()
     assert (existing / "user.md").read_text() == "user knowledge\n"
+
+
+def test_restore_cleans_legacy_knowledge_link_from_old_marker(project, tmp_path):
+    # An old-version marker recorded a .knowledge symlink; restore must clean it.
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    inject_skill(repo)
+    _, marker, _ = skill_paths(project)
+
+    knowledge = project / ".knowledge"
+    os.symlink(repo / "src", knowledge)
+    record = json.loads(marker.read_text())
+    record["knowledge"] = {"path": str(knowledge), "backup": None}
+    marker.write_text(json.dumps(record))
+
+    assert restore_skill(owner_pid=os.getpid()) is True
+    assert not knowledge.exists()
+    assert not knowledge.is_symlink()
 
 
 def test_rendered_skill_content(project, tmp_path):
@@ -157,14 +164,15 @@ def test_rendered_skill_content(project, tmp_path):
     assert len(description_lines) == 1
     assert description_lines[0].removeprefix("description:").strip()
 
-    # The search-path lines point at the in-project .knowledge link.
-    knowledge = project / ".knowledge"
-    assert f"`{knowledge}/` as\nMarkdown files" in content
-    assert f"`{knowledge}/**/*.md`" in content
+    # The body points at the recall-engine MCP server tools.
+    assert "search_knowledge" in content
+    assert "read_note" in content
+    assert "recall-engine MCP server" in content
 
-    # Fully rendered: no leftover template placeholder.
+    # No leftover template placeholder or in-project link references.
     assert "{knowledge_dir}" not in content
     assert "{repo_path}" not in content
+    assert ".knowledge" not in content
 
 
 def test_rendered_skill_triggers_for_every_message(project, tmp_path):
@@ -279,7 +287,7 @@ def test_stale_marker_dead_pid_auto_restored(project, tmp_path, capsys):
     repo = tmp_path / "repo"
     inject_skill(repo)
     assert "stale wrap session" in capsys.readouterr().err
-    assert f"{project / '.knowledge'}/" in (skill_dir / "SKILL.md").read_text()
+    assert "search_knowledge" in (skill_dir / "SKILL.md").read_text()
     assert json.loads(marker.read_text())["pids"] == [os.getpid()]
 
 

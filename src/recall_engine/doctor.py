@@ -9,6 +9,7 @@ from pathlib import Path
 from recall_engine.agents import AGENTS
 from recall_engine.config import ConfigError, resolve_settings
 from recall_engine.drive import DriveError, build_drive_service, execute
+from recall_engine.mcp_supervisor import server_status
 from recall_engine.repo import RepoError, resolve_ssh_key
 
 
@@ -48,6 +49,66 @@ def _check_agents() -> bool:
             "\n".join(spec.install_hint for spec in AGENTS.values()),
         )
     return found
+
+
+def _check_mcp() -> bool:
+    """The shared knowledge MCP server needs the `mcp` package importable."""
+    try:
+        import mcp  # noqa: F401
+    except ImportError:
+        _fail(
+            "mcp package",
+            "python 'mcp' package not importable",
+            "reinstall recall-engine so its dependencies are present",
+        )
+        return False
+    _ok("mcp package", "streamable-HTTP MCP server available")
+    return True
+
+
+def _check_mcp_server() -> bool:
+    """Reachability of the shared server. Not running is normal: `wrap` starts
+    it on demand. A recorded but unreachable server means stale state.
+    """
+    status = server_status()
+    if status is None:
+        print("[skip] mcp server: not running (started on demand by `wrap`)")
+        return True
+    if status.reachable:
+        _ok(
+            "mcp server",
+            f"reachable at {status.url} (pid {status.pid}, {len(status.owners)} owner(s))",
+        )
+        return True
+    _fail(
+        "mcp server",
+        f"recorded at {status.url} but not reachable (stale state)",
+        "run `recall-engine unwrap` to clear it; the next `wrap` respawns the server",
+    )
+    return False
+
+
+def _report_pi_mcp_adapter() -> None:
+    """Informational: pi reaches the MCP server only via pi-mcp-adapter."""
+    if shutil.which("pi") is None:
+        return
+    print(
+        "[note] pi: install the pi-mcp-adapter extension so pi can reach the "
+        "recall-engine MCP server (`pi install pi-mcp-adapter`)"
+    )
+
+
+def _report_codex_trust() -> None:
+    """Informational: codex reads a project's .codex/config.toml only for
+    trusted projects, so the injected server stays invisible until the project
+    is trusted (the first `codex` run in it prompts to trust)."""
+    if shutil.which("codex") is None:
+        return
+    print(
+        "[note] codex: reads the injected .codex/config.toml only in trusted "
+        "projects; if the recall-engine tools do not appear, run codex once in "
+        "the project and accept the trust prompt"
+    )
 
 
 def _check_ssh_key() -> bool:
@@ -108,9 +169,13 @@ def run_doctor() -> bool:
     results = [
         _check_git(),
         _check_agents(),
+        _check_mcp(),
+        _check_mcp_server(),
         _check_ssh_key(),
         _check_repo_config(),
         _check_drive_access(),
     ]
+    _report_pi_mcp_adapter()
+    _report_codex_trust()
     _report_drive_folder()
     return all(results)

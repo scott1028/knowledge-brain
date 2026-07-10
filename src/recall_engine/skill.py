@@ -6,27 +6,21 @@ the other agents' skills dirs (.claude/.gemini/.pi) get relative symlinks to it.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import shutil
 import sys
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
 
 from recall_engine.agents import AGENTS, SKILLS_SSOT_DIR
+from recall_engine.state import atomic_write_json, file_lock, is_pid_alive
 
 SKILL_NAME = "recall-engine"
 MARKER_NAME = ".recall-engine-marker.json"
 LOCK_NAME = ".recall-engine.lock"
 BACKUP_NAME = ".recall-engine-backup"
-
-# In-project link exposing the (possibly out-of-project) knowledge <repo>/src,
-# so sandboxed agents can reach it via a path inside the project.
-KNOWLEDGE_LINK_NAME = ".knowledge"
-KNOWLEDGE_BACKUP_NAME = ".knowledge.recall-engine-backup"
 
 # Pre-SSOT versions kept their marker under .claude/skills/.
 LEGACY_SKILLS_DIR = ".claude/skills"
@@ -40,12 +34,6 @@ def _paths() -> tuple[Path, Path, Path]:
     """Return (skill dir, marker file, backup dir) under $CWD/.agents/skills/."""
     skills = Path.cwd() / SKILLS_SSOT_DIR
     return skills / SKILL_NAME, skills / MARKER_NAME, skills / BACKUP_NAME
-
-
-def _knowledge_paths() -> tuple[Path, Path]:
-    """Return (.knowledge link, its backup) under the project cwd."""
-    cwd = Path.cwd()
-    return cwd / KNOWLEDGE_LINK_NAME, cwd / KNOWLEDGE_BACKUP_NAME
 
 
 def _link_dirs() -> list[Path]:
@@ -64,31 +52,16 @@ def _link_dirs() -> list[Path]:
 
 
 def _is_pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Process exists but belongs to another user.
-        return True
-    return True
+    return is_pid_alive(pid)
 
 
 def _lock_path() -> Path:
     return Path.cwd() / SKILLS_SSOT_DIR / LOCK_NAME
 
 
-@contextmanager
 def _skills_lock():
     """Serialize inject/restore for this project dir; released on fd close/death."""
-    lock_file = _lock_path()
-    lock_file.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        os.close(fd)  # closing the fd releases the flock
+    return file_lock(_lock_path())
 
 
 def _marker_pids(record: dict) -> list[int]:
@@ -101,9 +74,7 @@ def _marker_pids(record: dict) -> list[int]:
 
 def _write_marker(marker: Path, record: dict) -> None:
     """Atomic marker write so concurrent readers never see a partial file."""
-    tmp = marker.parent / (marker.name + ".tmp")
-    tmp.write_text(json.dumps(record))
-    os.replace(tmp, marker)
+    atomic_write_json(marker, record)
 
 
 def _is_same_skill_path(path: Path, skill_dir: Path) -> bool:
@@ -186,11 +157,11 @@ def _inject_locked(repo_path: Path) -> None:
             shutil.rmtree(backup)
         skill_dir.rename(backup)
 
-    knowledge_link, knowledge_backup = _knowledge_paths()
-
+    # The skill is static: it points at the recall-engine MCP server's tools,
+    # which read the knowledge repo directly (no in-project link needed).
     template = files("recall_engine").joinpath("templates/SKILL.md").read_text()
     skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(template.format(knowledge_dir=knowledge_link))
+    (skill_dir / "SKILL.md").write_text(template)
 
     links: list[dict[str, str | None]] = []
     for skills_dir in _link_dirs():
@@ -216,25 +187,6 @@ def _inject_locked(repo_path: Path) -> None:
             {"path": str(link), "backup": str(link_backup) if link_backup else None}
         )
 
-    # Surface <repo>/src inside the project as .knowledge so sandboxed agents
-    # can reach an out-of-project knowledge repo via an in-project path.
-    kb_backup = None
-    if knowledge_link.exists() or knowledge_link.is_symlink():
-        print(
-            f"warning: existing {knowledge_link} moved to backup; "
-            "it will be restored when the wrap session ends.",
-            file=sys.stderr,
-        )
-        if knowledge_backup.exists() or knowledge_backup.is_symlink():
-            if knowledge_backup.is_symlink() or knowledge_backup.is_file():
-                knowledge_backup.unlink()
-            else:
-                shutil.rmtree(knowledge_backup)
-        knowledge_link.rename(knowledge_backup)
-        kb_backup = knowledge_backup
-    # Absolute target: the repo is usually outside the project tree.
-    os.symlink(repo_path / "src", knowledge_link)
-
     _write_marker(
         marker,
         {
@@ -242,10 +194,6 @@ def _inject_locked(repo_path: Path) -> None:
             "repo_path": str(repo_path),
             "backup": str(backup) if backup.exists() else None,
             "links": links,
-            "knowledge": {
-                "path": str(knowledge_link),
-                "backup": str(kb_backup) if kb_backup else None,
-            },
             "injected_at": datetime.now(timezone.utc).isoformat(),
         },
     )
