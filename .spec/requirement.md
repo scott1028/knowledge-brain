@@ -151,6 +151,12 @@ Scenario: restore after launch failure
 - When the launcher fails
 - Then the CLI restores the project skill state before exiting
 
+Scenario: restore when the session is interrupted or the terminal closes
+- Given a wrap session is running the agent
+- When the user presses Ctrl-C (SIGINT) or closes the terminal (SIGHUP)
+- Then the signal is forwarded to the agent and the wrapper stays alive
+- And it tears down its injected skill and MCP config before exiting
+
 ## Feature: Inject and Restore the Skill
 
 The skill injection must be reversible and safe around interrupted sessions.
@@ -196,6 +202,28 @@ Scenario: preserve an existing MCP config
 - When the wrapper injects its server entry
 - Then only the `recall-engine` entry is added
 - And the file's original content is restored after the session ends
+
+Scenario: tolerate a commented or empty pre-existing config
+- Given the agent's config file exists but is empty or contains JSONC comments
+  (gemini/opencode accept `//` and `/* */` comments)
+- When the wrapper injects its server entry
+- Then injection succeeds
+- And the file is restored byte-identical when the session ends
+
+Scenario: patch an outdated entry on a new wrap
+- Given an earlier version injected the `recall-engine` entry without a field
+  the current version adds (e.g. pi's `lifecycle`)
+- When a new wrap session registers the MCP server
+- Then the entry is re-asserted so the missing field is patched in
+- And no duplicate backup is created for an already-registered config
+
+Scenario: refuse an unparseable pre-existing config
+- Given the agent's config file is malformed (invalid JSON/TOML) or is not an
+  object/table
+- When the wrapper tries to inject its server entry
+- Then it fails with a clear message naming the file and exits `1`
+- And the original file is left untouched with no stray backup
+- And the skill it already injected is torn down
 
 Scenario: preserve an existing user skill
 - Given `recall-engine/` already exists in the SSOT dir or in an
@@ -289,8 +317,8 @@ Scenario: reclaim a stale server record
 Scenario: reach the server from pi
 - Given `pi` is installed without the `pi-mcp-adapter` extension
 - When the user runs `recall-engine wrap pi`
-- Then `doctor` advises installing the adapter
-- And pi still receives the skill, but without MCP tools
+- Then `wrap` refuses to launch and tells the user to install the adapter first
+- And `doctor` also advises installing it
 
 ## Feature: Use the Knowledge Base During Agent Sessions
 

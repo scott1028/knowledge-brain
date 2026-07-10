@@ -126,6 +126,10 @@ def test_pi_writes_dot_pi_mcp_json(project):
     entry = json.loads(path.read_text())["mcpServers"]["recall-engine"]
     assert entry["url"] == URL
     assert entry["headers"]["X-Recall-Repo"] == str(repo)
+    # pi-mcp-adapter only auto-connects servers with lifecycle keep-alive/eager.
+    assert entry["lifecycle"] == "keep-alive"
+    # directTools exposes the server's tools directly instead of via the proxy.
+    assert entry["directTools"] is True
 
     assert restore_mcp_config(owner_pid=os.getpid()) is True
     assert not path.exists()
@@ -245,6 +249,38 @@ def test_attach_same_repo_adds_pid_no_duplicate_backup(project):
         other.wait()
 
 
+def test_attach_reasserts_entry_to_patch_missing_fields(project):
+    # An older recall-engine could have injected a pi entry without `lifecycle`.
+    # Attaching to that live session must re-assert the current entry so the
+    # missing field is patched in, without creating a duplicate backup.
+    repo = project / "repo"
+    inject_mcp_config("pi", repo, URL, token=TOKEN)  # first owner
+    marker = marker_path(project)
+    path = config_path(project, "pi")
+    backup = Path(str(path) + ".recall-engine-mcp-backup")
+
+    # Simulate an old-version entry on disk (no lifecycle field).
+    data = json.loads(path.read_text())
+    del data["mcpServers"]["recall-engine"]["lifecycle"]
+    path.write_text(json.dumps(data))
+
+    other = live_pid()
+    try:
+        record = json.loads(marker.read_text())
+        record["pids"] = [other.pid]
+        marker.write_text(json.dumps(record))
+
+        inject_mcp_config("pi", repo, URL, token=TOKEN)  # attach -> re-assert
+        entry = json.loads(path.read_text())["mcpServers"]["recall-engine"]
+        assert entry["lifecycle"] == "keep-alive"  # patched back in
+        # Still one config, and no backup was created on the re-assert.
+        assert len(json.loads(marker.read_text())["configs"]) == 1
+        assert not backup.exists()
+    finally:
+        other.terminate()
+        other.wait()
+
+
 def test_first_owner_leaving_keeps_config_then_last_restores(project):
     repo = project / "repo"
     path = config_path(project, "claude")
@@ -321,6 +357,75 @@ def test_attach_refused_when_repo_differs(project):
     finally:
         other.terminate()
         other.wait()
+
+
+# --- 7. Robust handling of pre-existing / malformed configs ------------------
+
+
+def test_preexisting_jsonc_comments_tolerated_and_restored(project):
+    # gemini/opencode allow // and /* */ comments; injection must not choke.
+    repo = project / "repo"
+    path = config_path(project, "gemini")
+    path.parent.mkdir(parents=True)
+    original = '{\n  // my gemini settings\n  "theme": "dark"\n}\n'
+    path.write_text(original)
+
+    inject_mcp_config("gemini", repo, URL, token=TOKEN)
+    data = json.loads(path.read_text())  # injected file is plain, valid JSON
+    assert data["theme"] == "dark"
+    assert data["mcpServers"]["recall-engine"]["httpUrl"] == URL
+
+    assert restore_mcp_config(owner_pid=os.getpid()) is True
+    assert path.read_text() == original  # comments restored byte-identical
+
+
+def test_empty_preexisting_config_tolerated_and_restored(project):
+    repo = project / "repo"
+    path = config_path(project, "claude")
+    path.write_text("")  # an empty .mcp.json must not crash json.loads
+
+    inject_mcp_config("claude", repo, URL)
+    assert json.loads(path.read_text())["mcpServers"]["recall-engine"]["url"] == URL
+
+    assert restore_mcp_config(owner_pid=os.getpid()) is True
+    assert path.read_text() == ""
+
+
+def test_malformed_json_raises_clean_error_and_preserves_file(project):
+    repo = project / "repo"
+    path = config_path(project, "claude")
+    original = '{"mcpServers": oops'
+    path.write_text(original)
+
+    with pytest.raises(McpConfigError, match="not valid JSON"):
+        inject_mcp_config("claude", repo, URL)
+    # Original untouched; no marker and no stray backup left behind.
+    assert path.read_text() == original
+    assert not marker_path(project).exists()
+    assert not Path(str(path) + ".recall-engine-mcp-backup").exists()
+
+
+def test_wrong_shape_json_raises_clean_error(project):
+    repo = project / "repo"
+    path = config_path(project, "claude")
+    path.write_text("[]")  # valid JSON but an array, not an object
+
+    with pytest.raises(McpConfigError, match="not a JSON object"):
+        inject_mcp_config("claude", repo, URL)
+    assert path.read_text() == "[]"
+
+
+def test_malformed_toml_raises_clean_error_and_preserves_file(project):
+    repo = project / "repo"
+    path = config_path(project, "codex")
+    path.parent.mkdir(parents=True)
+    original = 'model = "unterminated\n'
+    path.write_text(original)
+
+    with pytest.raises(McpConfigError, match="not valid TOML"):
+        inject_mcp_config("codex", repo, URL)
+    assert path.read_text() == original
+    assert not Path(str(path) + ".recall-engine-mcp-backup").exists()
 
 
 # --- Misc -------------------------------------------------------------------

@@ -129,7 +129,8 @@ different repos therefore share a server yet only ever see their own notes.
 Two agents need extra setup to reach the server:
 
 - **pi** requires the `pi-mcp-adapter` extension (`pi install pi-mcp-adapter`).
-  Without it pi still gets the skill, but no MCP tools.
+  Without it pi cannot reach the server, so `wrap pi` refuses to launch and
+  tells you to install the adapter first.
 - **codex** reads the injected `.codex/config.toml` only in trusted projects;
   the first `codex` run in a project prompts you to trust it. Until then codex
   falls back to the shared `~/.codex/config.toml` and will not see the

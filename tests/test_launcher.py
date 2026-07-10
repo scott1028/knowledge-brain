@@ -1,4 +1,8 @@
 import os
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -7,6 +11,7 @@ from recall_engine.launcher import (
     LauncherError,
     detect_agent,
     launch_agent,
+    pi_mcp_adapter_installed,
 )
 
 
@@ -164,6 +169,85 @@ def test_detect_agent_none_on_missing_command(tmp_path, monkeypatch):
 def test_detect_agent_none_on_unsafe_name(tmp_path, monkeypatch):
     isolate_shell(tmp_path, monkeypatch)
     assert detect_agent("claude; rm -rf /") is None
+
+
+def install_fake_pi(tmp_path, monkeypatch, list_output: str, name: str = "pi") -> Path:
+    """Put a fake pi on PATH whose `list` subcommand prints list_output."""
+    bin_dir = install_fake_claude(
+        tmp_path,
+        monkeypatch,
+        'if [ "$1" = "list" ]; then\n'
+        f"  printf '%s\\n' '{list_output}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 0",
+        name=name,
+    )
+    return bin_dir
+
+
+def test_pi_mcp_adapter_installed_true(tmp_path, monkeypatch):
+    install_fake_pi(tmp_path, monkeypatch, "User packages:  npm:pi-mcp-adapter")
+    assert pi_mcp_adapter_installed("pi") is True
+
+
+def test_pi_mcp_adapter_installed_false_when_absent(tmp_path, monkeypatch):
+    # pi runs but the adapter is not among the installed packages.
+    install_fake_pi(tmp_path, monkeypatch, "User packages:  npm:pi-web-access")
+    assert pi_mcp_adapter_installed("pi") is False
+
+
+def test_pi_mcp_adapter_installed_none_when_pi_missing(tmp_path, monkeypatch):
+    # pi not runnable -> None (undetermined), so wrap defers to the launch error.
+    isolate_shell(tmp_path, monkeypatch)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    assert pi_mcp_adapter_installed("pi") is None
+
+
+def test_pi_mcp_adapter_installed_none_on_unsafe_name(tmp_path, monkeypatch):
+    isolate_shell(tmp_path, monkeypatch)
+    assert pi_mcp_adapter_installed("pi; rm -rf /") is None
+
+
+def test_sighup_does_not_kill_wrapper_before_teardown(tmp_path, monkeypatch):
+    # Closing the terminal sends SIGHUP. Default SIGHUP would terminate the
+    # wrapper before wrap's finally can restore the injected config; launch_agent
+    # must catch/forward it so the process survives to tear down. Run in a
+    # subprocess so a regression fails cleanly instead of hangup-killing pytest.
+    started = tmp_path / "started"
+    install_fake_claude(
+        tmp_path,
+        monkeypatch,
+        f"trap '' HUP INT TERM\necho started > \"{started}\"\nsleep 3\n",
+    )
+    runner = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from recall_engine.launcher import launch_agent\n"
+            "sys.exit(launch_agent(Path(sys.argv[1]), agent='claude'))",
+            str(tmp_path / "repo"),
+        ],
+        env=os.environ.copy(),
+    )
+    try:
+        for _ in range(200):
+            if started.exists():
+                break
+            time.sleep(0.05)
+        assert started.exists(), "fake agent never started"
+        runner.send_signal(signal.SIGHUP)
+        returncode = runner.wait(timeout=15)
+    finally:
+        if runner.poll() is None:
+            runner.kill()
+            runner.wait()
+    # Survived SIGHUP (would be -SIGHUP if the default handler had killed it).
+    assert returncode != -signal.SIGHUP
 
 
 def test_detect_agent_via_shell_function(tmp_path, monkeypatch):

@@ -18,9 +18,11 @@ from recall_engine.drive import (
     sync_upload,
 )
 from recall_engine.launcher import (
+    PI_MCP_ADAPTER,
     LauncherError,
     detect_agent,
     launch_agent,
+    pi_mcp_adapter_installed,
 )
 from recall_engine.mcp_config import (
     McpConfigError,
@@ -70,6 +72,18 @@ def wrap(ctx: typer.Context, agent: str) -> None:
             f"'{agent}' does not look like a supported agent CLI "
             f"({'/'.join(AGENTS)}); `{agent} --version` did not match any "
             "known agent.",
+            err=True,
+        )
+        raise typer.Exit(2)
+    # pi only reaches the MCP server through the pi-mcp-adapter extension; block
+    # launch until it is installed (skill-only pi would silently miss the tools).
+    # `is False` only: None means pi is not runnable, left to launch_agent's
+    # 'install pi' error below.
+    if family == "pi" and pi_mcp_adapter_installed(agent) is False:
+        typer.echo(
+            f"pi is missing the {PI_MCP_ADAPTER} extension, which it needs to "
+            "reach the recall-engine MCP server. Install it and re-run:\n"
+            f"    pi install {PI_MCP_ADAPTER}",
             err=True,
         )
         raise typer.Exit(2)

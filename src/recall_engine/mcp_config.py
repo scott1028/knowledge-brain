@@ -81,20 +81,87 @@ def _write_entry(spec: McpConfigSpec, repo_path: Path, url: str, token: str | No
         _write_json_entry(spec, config_path, url, headers)
 
 
+def _strip_jsonc(text: str) -> str:
+    """Drop // line and /* */ block comments, ignoring them inside strings.
+    gemini/opencode accept JSONC-style comments in their config files."""
+    out = []
+    i, n = 0, len(text)
+    in_str = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:  # keep escaped char verbatim
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+        elif c == "/" and i + 1 < n and text[i + 1] == "/":
+            i += 2
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _load_json_object(config_path: Path) -> dict:
+    """Read an agent's JSON config into a dict. Tolerate an empty file and
+    JSONC comments; raise McpConfigError on content we cannot safely merge."""
+    text = config_path.read_text()
+    if not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            data = json.loads(_strip_jsonc(text))
+        except json.JSONDecodeError as exc:
+            raise McpConfigError(
+                f"{config_path} is not valid JSON, so recall-engine cannot "
+                f"register its MCP server in it; fix or move the file ({exc})."
+            ) from exc
+    if not isinstance(data, dict):
+        raise McpConfigError(
+            f"{config_path} is not a JSON object, so recall-engine cannot "
+            "register its MCP server in it; fix or move the file."
+        )
+    return data
+
+
 def _write_json_entry(
     spec: McpConfigSpec, config_path: Path, url: str, headers: dict[str, str]
 ) -> None:
-    if config_path.exists():
-        existing = json.loads(config_path.read_text())
-    else:
-        existing = {}
+    existing = _load_json_object(config_path) if config_path.exists() else {}
     entry = {
         spec.url_field: url,
         spec.header_field: headers,
         **({"type": spec.type_value} if spec.type_value else {}),
         **spec.extra_fields,
     }
-    servers = existing.setdefault(spec.servers_key, {})
+    servers = existing.get(spec.servers_key)
+    if servers is None:
+        servers = {}
+        existing[spec.servers_key] = servers
+    elif not isinstance(servers, dict):
+        raise McpConfigError(
+            f"{config_path}: '{spec.servers_key}' is not a JSON object; "
+            "recall-engine will not modify it."
+        )
     servers[MCP_SERVER_NAME] = entry
     config_path.write_text(json.dumps(existing, indent=2))
 
@@ -103,9 +170,16 @@ def _write_toml_entry(
     spec: McpConfigSpec, config_path: Path, url: str, headers: dict[str, str]
 ) -> None:
     import tomlkit
+    from tomlkit.exceptions import TOMLKitError
 
     if config_path.exists():
-        doc = tomlkit.parse(config_path.read_text())
+        try:
+            doc = tomlkit.parse(config_path.read_text())
+        except (TOMLKitError, ValueError) as exc:
+            raise McpConfigError(
+                f"{config_path} is not valid TOML, so recall-engine cannot "
+                f"register its MCP server in it; fix or move the file ({exc})."
+            ) from exc
     else:
         doc = tomlkit.document()
     if spec.servers_key not in doc:
@@ -166,6 +240,12 @@ def _inject_locked(
                 configs.append(
                     _backup_and_write(agent, spec, config_path, repo_path, url, token)
                 )
+            else:
+                # Already registered: re-assert the entry so a recall-engine
+                # upgrade patches new/changed fields (e.g. pi's lifecycle) into
+                # a config an older version injected. The first-touch backup
+                # still holds the user's original, so restore stays correct.
+                _write_entry(spec, repo_path, url, token)
             atomic_write_json(marker, record)
             return
         # No live owner (all dead): clean up stale state, then re-inject fresh.
@@ -202,7 +282,14 @@ def _backup_and_write(
     if existed:
         backup = _backup_path(config_path)
         shutil.copy2(config_path, backup)
-    _write_entry(spec, repo_path, url, token)
+    try:
+        _write_entry(spec, repo_path, url, token)
+    except Exception:
+        # A parse/shape error must not leave a stray backup behind (the
+        # original config is untouched since the write never happened).
+        if backup is not None:
+            backup.unlink(missing_ok=True)
+        raise
     return {
         "agent": agent,
         "path": str(config_path),

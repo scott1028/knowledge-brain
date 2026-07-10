@@ -81,13 +81,18 @@ AGENTS: dict[str, AgentSpec] = {
         version_signature=None,  # `pi --version` prints a bare version number
         install_hint="install pi: https://github.com/earendil-works/pi",
         # pi via pi-mcp-adapter reads .pi/mcp.json (kept distinct from Claude's
-        # project-root .mcp.json to avoid a collision).
+        # project-root .mcp.json to avoid a collision). lifecycle "keep-alive"
+        # makes the adapter connect at startup and auto-reconnect on drop;
+        # without it the entry defaults to "lazy" and pi never auto-connects.
+        # directTools registers the server's three tools directly in pi's tool
+        # list instead of hiding them behind the `mcp` proxy the LLM must search.
         mcp=McpConfigSpec(
             config_path=".pi/mcp.json",
             fmt="json",
             servers_key="mcpServers",
             url_field="url",
             header_field="headers",
+            extra_fields={"lifecycle": "keep-alive", "directTools": True},
         ),
     ),
     "gemini": AgentSpec(

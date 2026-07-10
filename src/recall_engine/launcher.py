@@ -16,6 +16,10 @@ from recall_engine.agents import AGENTS
 # (literal interpolation keeps alias/function resolution working).
 _AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 
+# pi reaches the MCP server only through this extension; without it the injected
+# .pi/mcp.json is inert, so `wrap pi` must block until the user installs it.
+PI_MCP_ADAPTER = "pi-mcp-adapter"
+
 
 class LauncherError(Exception):
     """The agent cannot be launched."""
@@ -58,6 +62,32 @@ def detect_agent(agent: str) -> str | None:
     return None
 
 
+def pi_mcp_adapter_installed(agent: str) -> bool | None:
+    """Whether `<agent> list` reports the pi-mcp-adapter extension.
+
+    Returns True when the adapter is present, False when pi runs but the
+    adapter is absent, and None when it cannot be determined (pi not runnable,
+    probe failed/timed out) so the caller falls back to the normal launch path
+    and its 'install pi' error. Probed through the interactive shell like
+    detect_agent/launch so pi wrappers (aliases/functions) resolve too; stdin
+    is closed so pi's project-trust prompt can never block the probe.
+    """
+    if not _AGENT_NAME_RE.match(agent):
+        return None
+    try:
+        probe = subprocess.run(
+            [_resolve_shell(), "-i", "-c", f"{agent} list"],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if probe.returncode != 0:
+        return None
+    return PI_MCP_ADAPTER in (probe.stdout + probe.stderr).decode(errors="replace")
+
+
 def launch_agent(
     repo_path: Path,
     argv: list[str] | None = None,
@@ -71,7 +101,9 @@ def launch_agent(
     so rc-file shell functions and aliases (e.g. ~/.bashrc.d/claude) apply,
     matching what typing the command in a terminal does.
     stdin/stdout/stderr are inherited so the interactive TUI works.
-    SIGINT/SIGTERM are forwarded to the child while it runs.
+    SIGINT/SIGTERM/SIGHUP are forwarded to the child while it runs; handling
+    SIGHUP keeps this process alive long enough to tear down the injected
+    config when the terminal is closed (default SIGHUP would kill it first).
 
     pre_args are placed before the caller's argv (e.g. agy's `--add-dir
     <project>`, needed for it to see the injected .agents/ config).
@@ -101,7 +133,8 @@ def launch_agent(
         child.send_signal(signum)
 
     previous = {
-        sig: signal.signal(sig, forward) for sig in (signal.SIGINT, signal.SIGTERM)
+        sig: signal.signal(sig, forward)
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
     }
     try:
         returncode = child.wait()

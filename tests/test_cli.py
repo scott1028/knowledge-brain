@@ -89,6 +89,53 @@ def test_wrap_detects_claude_wrapper(monkeypatch, tmp_path):
     assert "launching claude-company..." in result.output
 
 
+def test_wrap_pi_blocks_without_adapter(monkeypatch, tmp_path):
+    # pi runs but lacks pi-mcp-adapter -> wrap refuses before any injection.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    install_fake_claude(
+        tmp_path,
+        monkeypatch,
+        'if [ "$1" = "list" ]; then echo "  npm:pi-web-access"; exit 0; fi\nexit 0',
+        name="pi",
+    )
+    monkeypatch.setenv("KNOWLEDGE_REPO_PATH", str(repo))
+    monkeypatch.delenv("KNOWLEDGE_REPO_SSH", raising=False)
+    monkeypatch.chdir(project)
+
+    result = runner.invoke(app, ["wrap", "pi"])
+    assert result.exit_code == 2
+    assert "pi install pi-mcp-adapter" in result.output
+    # Blocked before setup: nothing injected, nothing launched.
+    assert "launching pi..." not in result.output
+    assert not (project / ".pi" / "mcp.json").exists()
+
+
+def test_wrap_pi_launches_with_adapter(monkeypatch, tmp_path):
+    # pi reports the adapter -> wrap proceeds through the full lifecycle.
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    project = tmp_path / "project"
+    project.mkdir()
+    install_fake_claude(
+        tmp_path,
+        monkeypatch,
+        'if [ "$1" = "list" ]; then echo "  npm:pi-mcp-adapter"; exit 0; fi\nexit 0',
+        name="pi",
+    )
+    monkeypatch.setenv("KNOWLEDGE_REPO_PATH", str(repo))
+    monkeypatch.delenv("KNOWLEDGE_REPO_SSH", raising=False)
+    monkeypatch.chdir(project)
+
+    result = runner.invoke(app, ["wrap", "pi"])
+    assert result.exit_code == 0
+    assert "launching pi..." in result.output
+    # Injected .pi/mcp.json is cleaned up on exit.
+    assert not (project / ".pi" / "mcp.json").exists()
+
+
 def test_wrap_claude_repo_error_exits_1(monkeypatch, tmp_path):
     monkeypatch.setenv("KNOWLEDGE_REPO_PATH", str(tmp_path / "missing"))
     monkeypatch.delenv("KNOWLEDGE_REPO_SSH", raising=False)
