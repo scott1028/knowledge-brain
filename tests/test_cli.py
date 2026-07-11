@@ -1,10 +1,23 @@
+import glob
 import json
 import os
+import sqlite3
+import tempfile
+from pathlib import Path
 import pytest
 from typer.testing import CliRunner
+from recall_engine import index
 from recall_engine.cli import app
 from recall_engine.mcp_supervisor import ServerInfo
 runner = CliRunner()
+@pytest.fixture(autouse=True)
+def _clean_tmp_indexes():
+    """Remove only the temp-dir index DBs that a test's wrap build creates."""
+    pattern = str(Path(tempfile.gettempdir()) / f"{index.TMP_DB_PREFIX}*")
+    before = set(glob.glob(pattern))
+    yield
+    for path in set(glob.glob(pattern)) - before:
+        Path(path).unlink(missing_ok=True)
 @pytest.fixture(autouse=True)
 def stub_mcp_server(monkeypatch):
     """Keep `wrap`/`unwrap` from spawning a real server or touching the global
@@ -144,6 +157,32 @@ def test_wrap_claude_full_lifecycle(monkeypatch, tmp_path):
     assert not (
         project / ".agents" / "skills" / ".recall-engine-marker.json"
     ).exists()
+def test_wrap_builds_sqlite_index(monkeypatch, tmp_path):
+    # wrap eager-builds the temp-dir index at startup (before the first search).
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "n.md").write_text("hello keyword\n")
+    project = tmp_path / "project"
+    project.mkdir()
+    install_fake_claude(tmp_path, monkeypatch, "exit 0")
+    monkeypatch.setenv("KNOWLEDGE_REPO_PATH", str(repo))
+    monkeypatch.chdir(project)
+    result = runner.invoke(app, ["wrap", "claude"])
+    assert result.exit_code == 0
+    db_path = index.index_db_path(repo.resolve())
+    assert db_path.exists()
+    assert f"knowledge index: {db_path}" in result.output
+    assert not (repo / ".sqlite3.db").exists()  # no longer inside the repo
+    # The startup build initialized the index with the note's content, not just
+    # an empty DB file.
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = dict(conn.execute("SELECT relative_path, content FROM notes").fetchall())
+    finally:
+        conn.close()
+    assert rows == {"src/n.md": "hello keyword\n"}
+
+
 def test_wrap_injects_and_restores_mcp_config(monkeypatch, tmp_path):
     # The agent's MCP config points at the shared server (with the repo header)
     # while it runs, and is cleaned up afterwards. No .knowledge link is created.

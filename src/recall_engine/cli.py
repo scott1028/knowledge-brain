@@ -7,6 +7,7 @@ from pathlib import Path
 
 import typer
 
+from recall_engine import index
 from recall_engine.agents import AGENTS
 from recall_engine.config import ConfigError, resolve_settings
 from recall_engine.doctor import run_doctor
@@ -100,6 +101,10 @@ def wrap(ctx: typer.Context, agent: str) -> None:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from exc
     typer.echo(f"knowledge repo: {repo}")
+    # Eager-build the SQLite index at startup so it exists before the first
+    # search; the server still owns the live watchdog. Best-effort.
+    if index.build_index(repo):
+        typer.echo(f"knowledge index: {index.index_db_path(repo)}")
     pid = os.getpid()
     # Inject the skill (the reliable "search first" trigger), start/reuse the
     # shared MCP server, and point this agent's config at it. All three are torn

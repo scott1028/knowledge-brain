@@ -15,6 +15,7 @@ from pathlib import Path
 import uvicorn
 from mcp.server.fastmcp import Context, FastMCP
 
+from recall_engine import index
 from recall_engine.template_renderer import render_template
 
 INSTRUCTIONS = render_template("rules/mcp_server_instructions.md").strip()
@@ -95,39 +96,48 @@ def create_server(token: str | None = None) -> FastMCP:
             "resource_uri": note_resource_uri(src, note),
         }
 
-    def iter_note_paths(src: Path) -> list[Path]:
-        notes: list[Path] = []
-        for note in sorted(src.rglob("*.md")):
-            if not note.is_file():
-                continue
-            resolved = note.resolve()
-            if resolved != src and src not in resolved.parents:
-                continue
-            notes.append(note)
-        return notes
+    def scan_lines(
+        src: Path, note: Path, content: str, needle: str, matches: list[dict]
+    ) -> bool:
+        """Append line matches for one note; return True once MAX_MATCHES is hit."""
+        for lineno, line in enumerate(content.splitlines(), start=1):
+            if needle in line.lower():
+                matches.append(
+                    {
+                        "path": str(note),
+                        "line": lineno,
+                        "snippet": line.strip(),
+                        "resource_uri": note_resource_uri(src, note),
+                    }
+                )
+                if len(matches) >= MAX_MATCHES:
+                    return True
+        return False
 
     @mcp.tool()
     def search_knowledge(query: str, ctx: Context) -> list[dict]:
-        """Case-insensitive substring search across <repo>/src/**/*.md."""
-        src = (resolve_repo(ctx) / "src").resolve()
+        """Case-insensitive substring search across <repo>/src/**/*.md.
+
+        Prefers the SQLite index (<repo>/.sqlite3.db) kept live by a watchdog;
+        falls back to a direct filesystem scan when the index is unavailable.
+        """
+        repo = resolve_repo(ctx)
+        src = (repo / "src").resolve()
         needle = query.lower()
         matches: list[dict] = []
-        for note in iter_note_paths(src):
-            for lineno, line in enumerate(
-                note.read_text(encoding="utf-8", errors="replace").splitlines(),
-                start=1,
-            ):
-                if needle in line.lower():
-                    matches.append(
-                        {
-                            "path": str(note),
-                            "line": lineno,
-                            "snippet": line.strip(),
-                            "resource_uri": note_resource_uri(src, note),
-                        }
-                    )
-                    if len(matches) >= MAX_MATCHES:
-                        return matches
+
+        repo_index = index.ensure_index(repo)
+        if repo_index is not None and repo_index.db_path.exists():
+            for rel, content in repo_index.search(query, MAX_MATCHES):
+                if scan_lines(src, repo / rel, content, needle, matches):
+                    break
+            return matches
+
+        # As-is fallback: no index / build failed.
+        for note in index.iter_note_paths(src):
+            content = note.read_text(encoding="utf-8", errors="replace")
+            if scan_lines(src, note, content, needle, matches):
+                break
         return matches
 
     # Add list/read tool adapters only if a supported client cannot use MCP resources.
@@ -144,7 +154,7 @@ def create_server(token: str | None = None) -> FastMCP:
         src = (resolve_repo(ctx) / "src").resolve()
         return [
             note_index_entry(src, note)
-            for note in iter_note_paths(src)
+            for note in index.iter_note_paths(src)
         ]
 
     @mcp.resource(
@@ -167,4 +177,8 @@ def run_server(host: str, port: int, token: str | None = None) -> None:
     """Serve the recall-engine MCP server over streamable HTTP (blocking)."""
     mcp = create_server(token)
     app = mcp.streamable_http_app()
-    uvicorn.run(app, host=host, port=port, log_level="error")
+    try:
+        uvicorn.run(app, host=host, port=port, log_level="error")
+    finally:
+        # On exit no one needs this server's indexes; drop their DB files.
+        index.reset_indexes()

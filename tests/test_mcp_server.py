@@ -15,7 +15,13 @@ import pytest
 import uvicorn
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
+from recall_engine import index
 from recall_engine.mcp_server import create_server
+@pytest.fixture(autouse=True)
+def _reset_indexes():
+    """Stop each test's observer and clear the registry before tmp cleanup."""
+    yield
+    index.reset_indexes()
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -142,6 +148,23 @@ def test_search_knowledge_hit_and_miss(server_port, tmp_path):
     miss = call_tool(server_port, "search_knowledge", {"query": "kubernetes"}, repo=str(repo))
     assert not miss.isError
     assert miss.structuredContent["result"] == []
+def test_search_builds_sqlite_index(server_port, tmp_path):
+    repo = make_repo(tmp_path / "repo", {"guide.md": "indexed keyword here\n"})
+    db_path = index.index_db_path(repo.resolve())
+    assert not db_path.exists()
+    hit = call_tool(server_port, "search_knowledge", {"query": "keyword"}, repo=str(repo))
+    assert not hit.isError
+    assert [m["path"] for m in hit.structuredContent["result"]] == [note_path(repo, "guide.md")]
+    # To-be path: the SQLite index is created (in the temp dir) on first search.
+    assert db_path.exists()
+def test_search_falls_back_to_scan_without_index(server_port, tmp_path, monkeypatch):
+    # With the DB in the temp dir, a read-only repo no longer blocks the build;
+    # force the index unavailable so search must use the direct-scan fallback.
+    repo = make_repo(tmp_path / "fb", {"n.md": "fallback keyword here\n"})
+    monkeypatch.setattr("recall_engine.index.ensure_index", lambda repo: None)
+    res = call_tool(server_port, "search_knowledge", {"query": "keyword"}, repo=str(repo))
+    assert not res.isError
+    assert [m["path"] for m in res.structuredContent["result"]] == [note_path(repo, "n.md")]
 def test_header_routing_between_repos(server_port, tmp_path):
     repo_a = make_repo(tmp_path / "a", {"a.md": "alpha keyword here\n"})
     repo_b = make_repo(tmp_path / "b", {"b.md": "alpha keyword here\n"})
