@@ -123,9 +123,21 @@ def launch_agent(
             f"{install_hint or 'fix your PATH.'}"
         )
 
-    env = {**os.environ, "RECALL_REPO_PATH": str(repo_path)}
+    env = {
+        **os.environ,
+        "RECALL_REPO_PATH": str(repo_path),
+        "_RECALL_PATH": os.environ.get("PATH", ""),
+    }
     child = subprocess.Popen(
-        [shell, "-i", "-c", f'{agent} "$@"', agent, *(pre_args or []), *(argv or [])],
+        [
+            shell,
+            "-i",
+            "-c",
+            f'set +m; PATH="$_RECALL_PATH:$PATH"; {agent} "$@"',
+            agent,
+            *(pre_args or []),
+            *(argv or []),
+        ],
         env=env,
     )
 

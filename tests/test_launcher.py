@@ -62,6 +62,28 @@ def test_shell_function_takes_priority_over_binary(tmp_path, monkeypatch):
     bashrc.write_text(f'claude() {{ echo "function $@" > "{out}"; }}\n')
     launch_agent(tmp_path, ["--flag"])
     assert out.read_text().strip() == "function --flag"
+def test_rc_path_prepend_cannot_shadow_the_inherited_path(tmp_path, monkeypatch):
+    # Regression: a re-sourced rc file must not reorder PATH ahead of the
+    # terminal environment that launched recall-engine.
+    out = tmp_path / "node.txt"
+    bin_dir = install_fake_claude(tmp_path, monkeypatch, "exit 0")
+    real = bin_dir / "node"
+    real.write_text('#!/bin/sh\necho REAL\n')
+    real.chmod(0o755)
+    shadow_dir = tmp_path / "shadow"
+    shadow_dir.mkdir()
+    stub = shadow_dir / "node"
+    stub.write_text('#!/bin/sh\necho STUB\n')
+    stub.chmod(0o755)
+    # Terminal PATH: the real node wins, the shadow dir trails behind it.
+    monkeypatch.setenv("PATH", os.environ["PATH"] + os.pathsep + str(shadow_dir))
+    bashrc = Path(os.environ["HOME"]) / ".bashrc"
+    bashrc.write_text(
+        f'export PATH="{shadow_dir}:$PATH"\n'
+        f'claude() {{ node > "{out}"; }}\n'
+    )
+    launch_agent(tmp_path)
+    assert out.read_text().strip() == "REAL"
 def test_missing_claude_raises(tmp_path, monkeypatch):
     isolate_shell(tmp_path, monkeypatch)
     empty = tmp_path / "empty"
