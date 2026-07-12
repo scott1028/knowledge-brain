@@ -84,6 +84,90 @@ def test_rc_path_prepend_cannot_shadow_the_inherited_path(tmp_path, monkeypatch)
     )
     launch_agent(tmp_path)
     assert out.read_text().strip() == "REAL"
+
+
+def test_bash_file_command_launches_directly_without_interactive_shell(
+    tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    out = tmp_path / "launch.txt"
+    pi = tmp_path / "pi"
+    pi.write_text(f'#!/bin/sh\necho direct > "{out}"\n')
+    pi.chmod(0o755)
+    fake_bash = tmp_path / "bash"
+    fake_bash.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "+m" ] && [ "$2" = "-i" ] && [ "$3" = "-c" ]; then\n'
+        '  if [ "$4" = "command -v pi" ]; then exit 0; fi\n'
+        '  case "$4" in\n'
+        '    *"type -t pi"*)\n'
+        f'    printf "startup noise\\nfile\\n%s\\n" "{pi}"\n'
+        "    exit 0\n"
+        "    ;;\n"
+        "  esac\n"
+        f'  echo interactive-shell > "{out}"\n'
+        "  exit 42\n"
+        "fi\n"
+        "exit 99\n"
+    )
+    fake_bash.chmod(0o755)
+    monkeypatch.setenv("SHELL", str(fake_bash))
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    assert launch_agent(repo, agent="pi") == 0
+    assert out.read_text().strip() == "direct"
+
+
+def test_pi_adapter_probe_preserves_inherited_path_priority(tmp_path, monkeypatch):
+    # Regression: the probe must use the same pi that the current terminal
+    # would run, even if the rc file prepends another pi on shell startup.
+    install_fake_pi(tmp_path, monkeypatch, "User packages: npm:pi-mcp-adapter")
+    shadow_dir = tmp_path / "shadow"
+    shadow_dir.mkdir()
+    stub = shadow_dir / "pi"
+    stub.write_text('#!/bin/sh\nif [ "$1" = "list" ]; then echo "User packages:"; fi\n')
+    stub.chmod(0o755)
+    # Terminal PATH: the real pi wins, the shadow dir trails behind it.
+    monkeypatch.setenv("PATH", os.environ["PATH"] + os.pathsep + str(shadow_dir))
+    bashrc = Path(os.environ["HOME"]) / ".bashrc"
+    bashrc.write_text(f'export PATH="{shadow_dir}:$PATH"\n')
+
+    assert pi_mcp_adapter_installed("pi") is True
+
+
+def test_pi_adapter_probe_runs_file_command_directly(tmp_path, monkeypatch):
+    out = tmp_path / "probe.txt"
+    pi = tmp_path / "pi"
+    pi.write_text(
+        "#!/bin/sh\n"
+        f'echo "$1" > "{out}"\n'
+        'if [ "$1" = "list" ]; then echo "npm:pi-mcp-adapter"; fi\n'
+    )
+    pi.chmod(0o755)
+    fake_bash = tmp_path / "bash"
+    fake_bash.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "+m" ] && [ "$2" = "-i" ] && [ "$3" = "-c" ]; then\n'
+        '  case "$4" in\n'
+        '    *"type -t pi"*)\n'
+        f'      printf "file\\n%s\\n" "{pi}"\n'
+        "      exit 0\n"
+        "      ;;\n"
+        '    *"pi list"*)\n'
+        f'      echo shell-list > "{out}"\n'
+        "      exit 0\n"
+        "      ;;\n"
+        "  esac\n"
+        "fi\n"
+        "exit 99\n"
+    )
+    fake_bash.chmod(0o755)
+    monkeypatch.setenv("SHELL", str(fake_bash))
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    assert pi_mcp_adapter_installed("pi") is True
+    assert out.read_text().strip() == "list"
 def test_missing_claude_raises(tmp_path, monkeypatch):
     isolate_shell(tmp_path, monkeypatch)
     empty = tmp_path / "empty"

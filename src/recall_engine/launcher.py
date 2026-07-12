@@ -29,6 +29,35 @@ def _resolve_shell() -> str:
     return os.environ.get("SHELL") or shutil.which("bash") or "/bin/bash"
 
 
+def _interactive_shell_command(shell: str, command: str, *args: str) -> list[str]:
+    """Build an interactive shell command with bash job control disabled early."""
+    if Path(shell).name == "bash":
+        return [shell, "+m", "-i", "-c", command, *args]
+    return [shell, "-i", "-c", command, *args]
+
+
+def _resolve_bash_file_command(
+    shell: str, agent: str, env: dict[str, str]
+) -> str | None:
+    """Return the resolved executable path when bash sees agent as a file."""
+    if Path(shell).name != "bash":
+        return None
+    probe = subprocess.run(
+        _interactive_shell_command(
+            shell, f'PATH="$_RECALL_PATH:$PATH"; type -t {agent}; command -v {agent}'
+        ),
+        capture_output=True,
+        env=env,
+    )
+    if probe.returncode != 0:
+        return None
+    lines = probe.stdout.decode(errors="replace").splitlines()
+    for index, line in enumerate(lines[:-1]):
+        if line.strip() == "file":
+            return lines[index + 1].strip() or None
+    return None
+
+
 def detect_agent(agent: str) -> str | None:
     """Classify an unknown command name into a supported agent family.
 
@@ -42,7 +71,7 @@ def detect_agent(agent: str) -> str | None:
         return None
     try:
         probe = subprocess.run(
-            [_resolve_shell(), "-i", "-c", f"{agent} --version"],
+            _interactive_shell_command(_resolve_shell(), f"{agent} --version"),
             capture_output=True,
             timeout=30,
         )
@@ -68,16 +97,32 @@ def pi_mcp_adapter_installed(agent: str) -> bool | None:
     Returns True when the adapter is present, False when pi runs but the
     adapter is absent, and None when it cannot be determined (pi not runnable,
     probe failed/timed out) so the caller falls back to the normal launch path
-    and its 'install pi' error. Probed through the interactive shell like
-    detect_agent/launch so pi wrappers (aliases/functions) resolve too; stdin
-    is closed so pi's project-trust prompt can never block the probe.
+    and its 'install pi' error. Bash file commands are resolved through the
+    shell and then probed directly with stdin closed, so pi's project-trust
+    prompt can never block the probe or disturb the foreground terminal.
     """
     if not _AGENT_NAME_RE.match(agent):
         return None
+    env = {
+        **os.environ,
+        "_RECALL_PATH": os.environ.get("PATH", ""),
+    }
+    shell = _resolve_shell()
+    resolved_file = _resolve_bash_file_command(shell, agent, env)
+    if resolved_file is None and Path(shell).name == "bash":
+        return None
+    command = (
+        [resolved_file, "list"]
+        if resolved_file is not None
+        else _interactive_shell_command(
+            shell, f'PATH="$_RECALL_PATH:$PATH"; {agent} list'
+        )
+    )
     try:
         probe = subprocess.run(
-            [_resolve_shell(), "-i", "-c", f"{agent} list"],
+            command,
             capture_output=True,
+            env=env,
             stdin=subprocess.DEVNULL,
             timeout=30,
         )
@@ -97,9 +142,10 @@ def launch_agent(
 ) -> int:
     """Run the agent command with RECALL_REPO_PATH set; return its exit code.
 
-    The agent is launched through the user's interactive shell ($SHELL -i -c)
-    so rc-file shell functions and aliases (e.g. ~/.bashrc.d/claude) apply,
-    matching what typing the command in a terminal does.
+    Bash file commands are resolved through the user's shell and launched
+    directly so interactive TUIs keep a clean foreground terminal. Shell
+    functions and aliases fall back to the user's interactive shell so rc-file
+    wrappers (e.g. ~/.bashrc.d/claude) still apply.
     stdin/stdout/stderr are inherited so the interactive TUI works.
     SIGINT/SIGTERM/SIGHUP are forwarded to the child while it runs; handling
     SIGHUP keeps this process alive long enough to tear down the injected
@@ -111,11 +157,17 @@ def launch_agent(
     if not _AGENT_NAME_RE.match(agent):
         raise LauncherError(f"Invalid agent name '{agent}'.")
     shell = _resolve_shell()
+    env = {
+        **os.environ,
+        "RECALL_REPO_PATH": str(repo_path),
+        "_RECALL_PATH": os.environ.get("PATH", ""),
+    }
 
     # Probe inside an interactive shell so functions/aliases count too.
     probe = subprocess.run(
-        [shell, "-i", "-c", f"command -v {agent}"],
+        _interactive_shell_command(shell, f"command -v {agent}"),
         capture_output=True,
+        env=env,
     )
     if probe.returncode != 0:
         raise LauncherError(
@@ -123,23 +175,18 @@ def launch_agent(
             f"{install_hint or 'fix your PATH.'}"
         )
 
-    env = {
-        **os.environ,
-        "RECALL_REPO_PATH": str(repo_path),
-        "_RECALL_PATH": os.environ.get("PATH", ""),
-    }
-    child = subprocess.Popen(
-        [
+    resolved_file = _resolve_bash_file_command(shell, agent, env)
+    if resolved_file is None:
+        command = _interactive_shell_command(
             shell,
-            "-i",
-            "-c",
             f'set +m; PATH="$_RECALL_PATH:$PATH"; {agent} "$@"',
             agent,
             *(pre_args or []),
             *(argv or []),
-        ],
-        env=env,
-    )
+        )
+    else:
+        command = [resolved_file, *(pre_args or []), *(argv or [])]
+    child = subprocess.Popen(command, env=env)
 
     def forward(signum: int, _frame: FrameType | None) -> None:
         child.send_signal(signum)
