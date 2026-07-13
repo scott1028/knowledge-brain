@@ -13,3 +13,7 @@ dist/
 .claude/
 .gemini/
 .pi/
+
+# Agent plugin runtime injection.
+.serena/
+
