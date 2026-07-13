@@ -215,10 +215,10 @@ def sync_download(service: Any, folder_id: str, dest: Path) -> list[str]:
 def sync_upload(service: Any, folder_id: str, src: Path) -> list[str]:
     """Upload every .md file in src (non-recursive) to the Drive folder.
 
-    Files are matched by name: an existing Drive file is updated in place,
-    otherwise a new plain-Markdown file is created (never converted to a
-    native Google Doc). A symlink pointing outside src/ is skipped: search may
-    serve such a note, but sync must not push external content to Drive.
+    Files are matched by name: an existing non-Google-Apps Drive file is updated
+    in place, otherwise a new plain-Markdown file is created (never converted
+    to a native Google Doc). A symlink pointing outside src/ is skipped: search
+    may serve such a note, but sync must not push external content to Drive.
     Returns the uploaded filenames.
     """
     if not src.is_dir():
@@ -242,10 +242,14 @@ def sync_upload(service: Any, folder_id: str, src: Path) -> list[str]:
                     f"name = '{escaped}' and '{folder_id}' in parents "
                     "and trashed = false"
                 ),
-                fields="files(id, name)",
+                fields="files(id, name, mimeType)",
             )
         )
-        matches = response.get("files", [])
+        matches = [
+            file
+            for file in response.get("files", [])
+            if not file.get("mimeType", "").startswith(GOOGLE_APPS_PREFIX)
+        ]
         media = MediaIoBaseUpload(io.BytesIO(path.read_bytes()), mimetype="text/markdown")
         if matches:
             execute(service.files().update(fileId=matches[0]["id"], media_body=media))

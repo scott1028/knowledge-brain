@@ -262,7 +262,16 @@ def test_upload_updates_existing_creates_new_and_escapes_name_query(tmp_path):
     src.mkdir()
     (src / "existing.md").write_text("existing\n")
     (src / "it's.md").write_text("quoted\n")
-    service = make_service([{"files": [{"id": "e1", "name": "existing.md"}]}, {"files": []}])
+    service = make_service(
+        [
+            {
+                "files": [
+                    {"id": "e1", "name": "existing.md", "mimeType": "text/markdown"}
+                ]
+            },
+            {"files": []},
+        ]
+    )
     uploaded = sync_upload(service, "folder1", src)
     assert uploaded == ["existing.md", "it's.md"]
     files_mock = service.files.return_value
@@ -274,6 +283,34 @@ def test_upload_updates_existing_creates_new_and_escapes_name_query(tmp_path):
     assert create_kwargs["media_body"].mimetype() == "text/markdown"
     query = files_mock.list.call_args_list[1].kwargs["q"]
     assert "name = 'it\\'s.md'" in query
+    assert (
+        files_mock.list.call_args_list[0].kwargs["fields"]
+        == "files(id, name, mimeType)"
+    )
+def test_upload_does_not_update_same_name_google_doc(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "note.md").write_text("# note\n")
+    service = make_service(
+        [
+            {
+                "files": [
+                    {
+                        "id": "doc1",
+                        "name": "note.md",
+                        "mimeType": drive.GOOGLE_DOC_MIME,
+                    }
+                ]
+            }
+        ]
+    )
+    assert sync_upload(service, "folder1", src) == ["note.md"]
+    files_mock = service.files.return_value
+    files_mock.update.assert_not_called()
+    files_mock.create.assert_called_once()
+    create_kwargs = files_mock.create.call_args.kwargs
+    assert create_kwargs["body"] == {"name": "note.md", "parents": ["folder1"]}
+    assert create_kwargs["media_body"].mimetype() == "text/markdown"
 def test_upload_skips_symlink_pointing_outside_src(tmp_path, capsys):
     # An external note is mounted for reading, not to be pushed to Drive; a
     # symlink landing inside src/ is ordinary content and still uploads.
